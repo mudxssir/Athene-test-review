@@ -26,8 +26,28 @@
  */
 
 import { z } from "zod";
+import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { resolveModelClient } from "@/lib/langgraph/llm-factory";
 import type { AtheneStateType, AtheneStateUpdate } from "../state";
+
+/**
+ * Strip non-text content blocks from a message's content.
+ * Models like haiku/sonnet throw if they receive image blocks they don't support.
+ * Returns the text-only string, or null if there is no text content at all.
+ */
+function extractTextContent(
+  content: unknown,
+): string | null {
+  if (typeof content === "string") return content || null;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((b): b is { type: "text"; text: string } => typeof b === "object" && b !== null && (b as Record<string, unknown>).type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    return text || null;
+  }
+  return null;
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -125,9 +145,35 @@ export async function supervisor(
   const llm = client.withStructuredOutput(routingSchema);
 
   // ── 3. LLM routing decision ──────────────────────────────────────────────
+  // Strip non-text content blocks (images, tool results) — supervisor models
+  // don't support vision and will throw on image content blocks.
+  const sanitizedMessages = state.messages
+    .map((msg) => {
+      const text = extractTextContent(msg.content);
+      if (text === msg.content) return msg;
+      if (msg instanceof HumanMessage) return new HumanMessage(text ?? "");
+      if (msg instanceof AIMessage)    return new AIMessage(text ?? "");
+      if (msg instanceof SystemMessage) return new SystemMessage(text ?? "");
+      return msg;
+    })
+    .filter((msg) => {
+      const text = extractTextContent(msg.content);
+      return text !== null && text.trim().length > 0;
+    });
+
+  if (sanitizedMessages.length === 0) {
+    return {
+      active_agent: "synthesis" as AtheneStateType["active_agent"],
+      next: "FINISH",
+      hop_count: hopCount,
+      reasoning: "No text content in messages — routed to synthesis for graceful response.",
+      run_status: "running",
+    };
+  }
+
   const rawDecision = await llm.invoke([
     { role: "system", content: SYSTEM_PROMPT },
-    ...state.messages,
+    ...sanitizedMessages,
   ]);
 
   const decision = rawDecision as {
